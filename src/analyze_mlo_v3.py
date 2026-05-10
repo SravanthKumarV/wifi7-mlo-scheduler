@@ -30,8 +30,41 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
+from scipy import stats as scipy_stats
 
 warnings.filterwarnings("ignore")
+
+
+def bootstrap_ci(data, stat_fn=np.percentile, stat_args=(99,),
+                 n_boot=2000, ci=0.95, rng=None):
+    """Return (lo, hi) bootstrap CI for stat_fn(data, *stat_args)."""
+    if rng is None:
+        rng = np.random.default_rng(42)
+    data = np.asarray(data)
+    if len(data) < 2:
+        point = stat_fn(data, *stat_args)
+        return point, point
+    boots = [stat_fn(rng.choice(data, len(data), replace=True), *stat_args)
+             for _ in range(n_boot)]
+    alpha = (1 - ci) / 2
+    return float(np.percentile(boots, alpha * 100)), float(np.percentile(boots, (1 - alpha) * 100))
+
+
+def mann_whitney_p99(comp_dir, load, seeds):
+    """
+    Return Mann-Whitney U p-value comparing per-packet latency
+    of STR (sched=0) vs Adaptive (sched=1) at the given load.
+    """
+    samples = {0: [], 1: []}
+    for sched in [0, 1]:
+        for seed in seeds:
+            df = load_samples_csv(comp_dir, sched, load, seed, max_rows=100000)
+            if df is not None and "latency_ms" in df.columns:
+                samples[sched].extend(df["latency_ms"].tolist())
+    if not samples[0] or not samples[1]:
+        return np.nan
+    _, p = scipy_stats.mannwhitneyu(samples[0], samples[1], alternative="two-sided")
+    return p
 
 
 def setup_style():
@@ -365,6 +398,7 @@ def fig_summary_bars(comp_df, comp_dir, ops, plots_dir, seeds=(1, 2, 3)):
     X-axis: percentile groups (90th, 95th, 99th, 100th).
     Y-axis: E2E latency (ms), log scale.
     Two bars per group: MLO-STR (blue) vs Adaptive OA (red).
+    P99 bars carry 95% bootstrap CI error bars.
     Matches style of Fig 1(b)/2(b) in Kulshrestha et al. IFIP 2024.
     """
     op_items  = sorted(ops.items())
@@ -373,31 +407,30 @@ def fig_summary_bars(comp_df, comp_dir, ops, plots_dir, seeds=(1, 2, 3)):
     x         = np.arange(len(pct_names))
     w         = 0.32
 
-    # Aggregate p90, p99, max from summary; p95 from samples
     op_loads = [info["load"] for _, info in op_items]
-    op_pcts  = {info["load"]: pct for pct, info in op_items}
 
-    # Build per-(sched, load) percentile table
-    # p90, p99, max come from summary; p95 computed from samples
+    # p90, p99, max from summary (mean over seeds)
     grp_sum = comp_df[comp_df["load_mbps"].isin(op_loads)].groupby(
         ["sched", "load_mbps"])[["p90_ms", "p99_ms", "max_ms"]].mean().reset_index()
 
-    # Compute p95 from samples.csv (pooled over seeds)
-    p95_records = []
+    # p95 + bootstrap CI on p99 from pooled samples across all seeds
+    stats_records = []
     for sched in [0, 1]:
         for load in op_loads:
             vals = []
             for seed in seeds:
-                df = load_samples_csv(comp_dir, sched, load, seed, max_rows=50000)
+                df = load_samples_csv(comp_dir, sched, load, seed, max_rows=100000)
                 if df is not None and "latency_ms" in df.columns:
                     vals.extend(df["latency_ms"].tolist())
             if vals:
-                p95_records.append({
-                    "sched": sched,
-                    "load_mbps": load,
-                    "p95_ms": float(np.percentile(vals, 95))
+                p95_val = float(np.percentile(vals, 95))
+                ci_lo, ci_hi = bootstrap_ci(vals, np.percentile, (99,))
+                stats_records.append({
+                    "sched": sched, "load_mbps": load,
+                    "p95_ms": p95_val,
+                    "p99_ci_lo": ci_lo, "p99_ci_hi": ci_hi,
                 })
-    p95_df = pd.DataFrame(p95_records) if p95_records else None
+    stats_df = pd.DataFrame(stats_records) if stats_records else None
 
     fig, axes = plt.subplots(1, n_ops, figsize=(2.8 * n_ops, 3.8), sharey=False)
     if n_ops == 1:
@@ -417,16 +450,23 @@ def fig_summary_bars(comp_df, comp_dir, ops, plots_dir, seeds=(1, 2, 3)):
             p100 = float(row_sum["max_ms"].values[0])
 
             p95 = np.nan
-            if p95_df is not None and not p95_df.empty:
-                r95 = p95_df[(p95_df["sched"] == sched) & (p95_df["load_mbps"] == load)]
-                if not r95.empty:
-                    p95 = float(r95["p95_ms"].values[0])
+            p99_err_lo = p99_err_hi = 0.0
+            if stats_df is not None and not stats_df.empty:
+                rs = stats_df[(stats_df["sched"] == sched) & (stats_df["load_mbps"] == load)]
+                if not rs.empty:
+                    p95 = float(rs["p95_ms"].values[0])
+                    p99_err_lo = max(0.0, p99 - float(rs["p99_ci_lo"].values[0]))
+                    p99_err_hi = max(0.0, float(rs["p99_ci_hi"].values[0]) - p99)
 
             heights = [p90, p95, p99, p100]
             offset  = (i - 0.5) * w
-            bars = ax.bar(x + offset, heights, w,
-                          color=SCHED_COLOR[sched], alpha=0.85,
-                          label=name, zorder=3)
+            ax.bar(x + offset, heights, w,
+                   color=SCHED_COLOR[sched], alpha=0.85,
+                   label=name, zorder=3)
+            # P99 error bar (index 2)
+            ax.errorbar(x[2] + offset, p99,
+                        yerr=[[p99_err_lo], [p99_err_hi]],
+                        fmt="none", color="black", capsize=3, lw=1.2, zorder=4)
 
         ax.set_yscale("log")
         ax.yaxis.set_major_formatter(mticker.FuncFormatter(
@@ -449,6 +489,18 @@ def fig_summary_bars(comp_df, comp_dir, ops, plots_dir, seeds=(1, 2, 3)):
     out = os.path.join(plots_dir, "fig5_latency_percentiles.png")
     fig.savefig(out); plt.close(fig)
     print(f"  [OK] {out}")
+
+
+def print_mannwhitney(comp_dir, ops, seeds):
+    """Print Mann-Whitney U p-values for each operating point."""
+    print("\nMann-Whitney U test (per-packet latency, STR vs Adaptive OA):")
+    print(f"  {'Load (Mbps)':<14} {'Target CO':<12} {'p-value':<12} {'Significant'}")
+    for pct, info in sorted(ops.items()):
+        load = info["load"]
+        p = mann_whitney_p99(comp_dir, load, seeds)
+        sig = "YES (p<0.05)" if (not np.isnan(p) and p < 0.05) else "no"
+        p_str = f"{p:.3e}" if not np.isnan(p) else "N/A"
+        print(f"  {int(load):<14} {int(pct*100):>3}%         {p_str:<12} {sig}")
 
 
 # ── Fig 6: CO overlay ─────────────────────────────────────────────────────────
@@ -631,6 +683,8 @@ def main():
     ap.add_argument("--plots-dir",  default="scratch/mlo_results_v4/plots_v4")
     ap.add_argument("--op-loads",   default=None,
                     help="Space-separated loads (e.g. '80 310 390 450 600 700')")
+    ap.add_argument("--seeds",      default=None,
+                    help="Space-separated seeds (default: all seeds found in summary)")
     args = ap.parse_args()
 
     setup_style()
@@ -646,9 +700,14 @@ def main():
         print("ERROR: comparative data missing"); return
     print(f"Comparative rows: {len(comp_df)}")
 
+    # Determine seeds: explicit list or all unique seeds in the data
+    if args.seeds:
+        seeds = tuple(int(s) for s in args.seeds.split())
+    else:
+        seeds = tuple(sorted(comp_df["seed"].dropna().astype(int).unique()))
+    print(f"Seeds used: {seeds}")
+
     op_loads_list = [float(x) for x in args.op_loads.split()] if args.op_loads else None
-    # Assign explicit target CO labels for each override load so that
-    # saturation loads (600, 700 Mbps) get distinct 0.95 / 0.99 labels
     LOAD_TO_TARGET = {80: 0.50, 310: 0.75, 390: 0.82, 450: 0.88,
                       600: 0.95, 700: 0.99}
     op_target_labels = (
@@ -656,7 +715,7 @@ def main():
         if op_loads_list else None
     )
     if op_target_labels and any(t is None for t in op_target_labels):
-        op_target_labels = None  # fall back to auto if unknown loads given
+        op_target_labels = None
     ops = find_operating_points(calib_df,
                                 targets=(0.50, 0.75, 0.82, 0.88),
                                 op_loads_override=op_loads_list,
@@ -665,14 +724,16 @@ def main():
 
     print("\nGenerating figures...")
     fig_calibration(calib_df, ops, args.plots_dir)
-    fig_co_timeseries(args.comp_dir, ops, args.plots_dir, seed=1)
-    fig_latency_timeseries(args.comp_dir, ops, args.plots_dir, seed=1)
-    fig_p_tid1(args.comp_dir, ops, args.plots_dir, seed=1)
-    fig_summary_bars(comp_df, args.comp_dir, ops, args.plots_dir, seeds=(1, 2, 3))
-    fig_co_overlay(args.comp_dir, ops, args.plots_dir, seed=1)
-    fig_latency_cdf(args.comp_dir, ops, args.plots_dir, seeds=(1, 2, 3))
-    fig_boxplots(args.comp_dir, ops, args.plots_dir, seeds=(1, 2, 3))
-    print("Done.")
+    fig_co_timeseries(args.comp_dir, ops, args.plots_dir, seed=seeds[0])
+    fig_latency_timeseries(args.comp_dir, ops, args.plots_dir, seed=seeds[0])
+    fig_p_tid1(args.comp_dir, ops, args.plots_dir, seed=seeds[0])
+    fig_summary_bars(comp_df, args.comp_dir, ops, args.plots_dir, seeds=seeds)
+    fig_co_overlay(args.comp_dir, ops, args.plots_dir, seed=seeds[0])
+    fig_latency_cdf(args.comp_dir, ops, args.plots_dir, seeds=seeds)
+    fig_boxplots(args.comp_dir, ops, args.plots_dir, seeds=seeds)
+
+    print_mannwhitney(args.comp_dir, ops, seeds)
+    print("\nDone.")
 
 
 if __name__ == "__main__":
