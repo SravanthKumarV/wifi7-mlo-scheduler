@@ -1,0 +1,17 @@
+# Large per-packet sample files (>25 MB each, not tracked)
+*_samples.csv
+
+# Build artifacts
+*.o
+*.a
+cmake-cache/
+build/
+
+# Python cache
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
