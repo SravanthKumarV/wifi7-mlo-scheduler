@@ -8,13 +8,14 @@
  *            via EDCA; HOL packet goes on whichever link wins contention
  *            first.  TID3 mapped to {Link0, Link1}; EDCA decides per-packet.
  *
- *   sched=1  Adaptive OA (occupancy-aware, MCAB-style)
- *            Periodically reads AP-side channel occupancy on both links
- *            via WifiCoTraceHelper (250 ms window).  Computes
- *              p = co0 / (co0 + co1)   [fraction to send on Link1]
- *            smoothed by EMA(alpha=0.30) to prevent oscillation.
- *            Uses SetPTid1(p): p fraction sent as TID3 (->Link1),
- *            (1-p) fraction sent as TID0 (->Link0).
+ *   sched=1  Adaptive OA (occupancy-aware, CO-equalizing)
+ *            Reads AP-side channel occupancy every 250 ms via
+ *            WifiCoTraceHelper.  Runs a proportional controller:
+ *              p <- clamp(p + K*(co0-co1), 0.05, 0.95)   K=0.2
+ *            Fixed point: co0==co1 (equalization), independent of
+ *            link capacity asymmetry.
+ *            Uses SetPTid1(p): p fraction sent as TID3 (->Link1 only),
+ *            (1-p) fraction sent as TID0 (->Link0 only).
  *
  * Topology (downlink AP -> STA):
  *   AP -- Link0 (5 GHz, 40 MHz, EhtMcs5 ) --> STA  (~95 Mbps MAC)
@@ -322,14 +323,17 @@ LogStats(Time period)
  * the measurement window, then either:
  *   sched=0 (Greedy): logs CO only; pTid1 stays at 1.0 forever
  *                     (EDCA contention determines link selection)
- *   sched=1 (Adaptive/MCAB): adjusts pTid1 via
- *                     tgt = co0 / (co0 + co1)   [MCAB formula]
- *                     smoothed: p = 0.70*p + 0.30*tgt, clamped [0.05,0.95]
+ *   sched=1 (Adaptive OA): proportional CO-equalizing controller
+ *                     p <- clamp(p + 0.2*(co0-co1), 0.05, 0.95)
+ *                     Fixed point: co0==co1; K=0.2 at T=250 ms
  *
  * All CO values are from the AP node (nodeId=0), matching the
  * measurement perspective described in the COMSNETS 2025 paper.
  * ================================================================ */
-static double g_pTid1Ema{0.75};
+/* Initial p = C1/(C0+C1) = 400/495 ~= 0.808 (capacity-weighted steady state).
+ * Ensures Link0 receives (1-p)*L < C0 = 95 Mbps for all loads up to ~495 Mbps,
+ * avoiding startup queue buildup on the narrow link. */
+static double g_pTid1Ema{0.808};
 
 static void
 SchedulerCb(WifiCoTraceHelper&  helper,
@@ -555,7 +559,7 @@ main(int argc, char* argv[])
      * sched=0 (Greedy): TID3 on {Link0,Link1}; EDCA contention decides per-packet.
      * sched=1 (Adaptive): TID0->Link0 only, TID3->Link1 only.
      *                     SetPTid1(p) controls what fraction is sent as TID3.
-     *                     The scheduler updates p every 250ms via MCAB formula.
+     *                     The scheduler updates p every 250 ms (proportional controller).
      */
     const std::string tidMapping =
         (schedType == 0) ? "0 0; 3 0,1; 1,2,4,5,6,7 1"
@@ -577,12 +581,11 @@ main(int argc, char* argv[])
 
     /* ---- Primary DL client (all traffic — no separate BG) ----
      * sched=0 (Greedy): pTid1=1.0 (always TID3; EDCA decides which link)
-     * sched=1 (Adaptive): pTid1=0.5 initially; SchedulerCb updates it
+     * sched=1 (Adaptive): pTid1=C1/(C0+C1)=400/495~=0.808 initially;
+     *                     SchedulerCb updates it every 250 ms.
      *                     All traffic steered by AP scheduler, no link hardwiring.
      */
-    /* Adaptive starts near the capacity-weighted steady state (cap1/(cap0+cap1))
-     * to avoid initial queue buildup before the proportional controller converges. */
-    double initPTid1 = (schedType == 0) ? 1.0 : 0.75;
+    double initPTid1 = (schedType == 0) ? 1.0 : 0.808;
     auto primary = InstallClient(ap.Get(0),
                                  sta.Get(0),
                                  loadMbps,
@@ -618,7 +621,7 @@ main(int argc, char* argv[])
     g_sampleCsv << "time_s,latency_ms\n";
 
     /* ---- Schedule periodic callbacks ---- */
-    const Time schedPeriod{Seconds(0.25)}; /* scheduler + CO log: 4 Hz (MCAB uses 0.25s) */
+    const Time schedPeriod{Seconds(0.25)}; /* scheduler + CO log: 4 Hz (250 ms) */
     const Time statPeriod{Seconds(0.25)};  /* latency stats: 4 Hz */
 
     Simulator::Schedule(tStart,
